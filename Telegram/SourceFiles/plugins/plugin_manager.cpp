@@ -13,6 +13,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_peer.h"
 #include "data/data_user.h"
 #include "main/main_session.h"
+#include "api/api_sending.h"
+#include "api/api_editing.h"
+#include "calls/calls_instance.h"
+#include "calls/calls_call.h"
+#include "storage/file_upload.h"
+#include "window/window_session_controller.h"
+#include "core/application.h"
+#include "base/unixtime.h"
+#include "webrtc/webrtc_video_track.h"
 
 extern "C" {
 #include <lua.h>
@@ -57,6 +66,10 @@ void PluginState::setEnabled(bool enabled) {
 void PluginState::clearLogs() {
 	_logs.clear();
 	_logsUpdated.fire({});
+}
+
+void PluginState::addLogError(const QString &msg) {
+	addLog(msg);
 }
 
 bool PluginState::load() {
@@ -143,6 +156,53 @@ bool PluginState::callHook(const char *hookName, int nargs, int nret) {
 	return true;
 }
 
+// Helper to push QString to Lua stack
+static void pushQString(lua_State *L, const QString &str) {
+	const auto utf = str.toUtf8();
+	lua_pushlstring(L, utf.constData(), utf.size());
+}
+
+// Helper to call a Lua hook with string arguments
+// Returns true if hook was called successfully, false if hook doesn't exist or error occurred
+bool callLuaHook(
+	lua_State *L,
+	PluginState *self,
+	const char *hookName,
+	const std::vector<QString> &stringArgs,
+	const std::vector<bool> &boolArgs = {},
+	const std::vector<int64> &intArgs = {}) {
+	if (!L) return false;
+	lua_getglobal(L, hookName);
+	if (!lua_isfunction(L, -1)) {
+		lua_pop(L, 1);
+		return false;
+	}
+	
+	int argCount = 0;
+	for (const auto &str : stringArgs) {
+		pushQString(L, str);
+		argCount++;
+	}
+	for (const bool b : boolArgs) {
+		lua_pushboolean(L, b ? 1 : 0);
+		argCount++;
+	}
+	for (const int64 i : intArgs) {
+		lua_pushinteger(L, i);
+		argCount++;
+	}
+	
+	if (lua_pcall(L, argCount, 0, 0) != LUA_OK) {
+		const QString err = QString::fromUtf8(lua_tostring(L, -1));
+		if (self) {
+			self->addLogError("[ERROR] Hook " + QString(hookName) + " failed: " + err);
+		}
+		lua_pop(L, 1);
+		return false;
+	}
+	return true;
+}
+
 void PluginState::fireNewMessage(
 	const QString &chatName,
 	const QString &senderName,
@@ -150,27 +210,182 @@ void PluginState::fireNewMessage(
 	bool isOutgoing)
 {
 	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onNewMessage", {chatName, senderName, text}, {isOutgoing});
+}
 
-	lua_getglobal(_L, "onNewMessage");
-	if (!lua_isfunction(_L, -1)) {
-		lua_pop(_L, 1);
-		return;
-	}
+void PluginState::fireMessageEdited(
+	const QString &chatName,
+	const QString &senderName,
+	const QString &oldText,
+	const QString &newText,
+	bool isOutgoing)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onMessageEdited", {chatName, senderName, oldText, newText}, {isOutgoing});
+}
 
-	const auto chatUtf = chatName.toUtf8();
-	const auto senderUtf = senderName.toUtf8();
-	const auto textUtf = text.toUtf8();
+void PluginState::fireMessageDeleted(
+	const QString &chatName,
+	const QString &senderName,
+	const QString &text,
+	bool isOutgoing)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onMessageDeleted", {chatName, senderName, text}, {isOutgoing});
+}
 
-	lua_pushlstring(_L, chatUtf.constData(), chatUtf.size());
-	lua_pushlstring(_L, senderUtf.constData(), senderUtf.size());
-	lua_pushlstring(_L, textUtf.constData(), textUtf.size());
-	lua_pushboolean(_L, isOutgoing ? 1 : 0);
+void PluginState::fireMessageSent(
+	const QString &chatName,
+	const QString &text,
+	bool isScheduled)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onMessageSent", {chatName, text}, {isScheduled});
+}
 
-	if (lua_pcall(_L, 4, 0, 0) != LUA_OK) {
-		const QString err = QString::fromUtf8(lua_tostring(_L, -1));
-		addLog("[ERROR] onNewMessage failed: " + err);
-		lua_pop(_L, 1);
-	}
+void PluginState::fireMessageReaction(
+	const QString &chatName,
+	const QString &senderName,
+	const QString &text,
+	const QString &reaction,
+	bool isOutgoing)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onMessageReaction", {chatName, senderName, text, reaction}, {isOutgoing});
+}
+
+void PluginState::firePeerUpdated(
+	const QString &peerName,
+	const QString &updateType)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onPeerUpdated", {peerName, updateType});
+}
+
+void PluginState::fireUserOnlineStatusChanged(
+	const QString &userName,
+	bool isOnline)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onUserOnlineStatusChanged", {userName}, {isOnline});
+}
+
+void PluginState::fireChatOpened(const QString &chatName)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onChatOpened", {chatName});
+}
+
+void PluginState::fireChatClosed(const QString &chatName)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onChatClosed", {chatName});
+}
+
+void PluginState::fireCallStarted(
+	const QString &userName,
+	bool isVideo,
+	bool isOutgoing)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onCallStarted", {userName}, {isVideo, isOutgoing});
+}
+
+void PluginState::fireCallEnded(
+	const QString &userName,
+	const QString &reason)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onCallEnded", {userName, reason});
+}
+
+void PluginState::fireFileUploadStarted(
+	const QString &fileName,
+	int64 fileSize)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onFileUploadStarted", {fileName}, {}, {fileSize});
+}
+
+void PluginState::fireFileUploadProgress(
+	const QString &fileName,
+	int64 uploaded,
+	int64 total)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onFileUploadProgress", {fileName}, {}, {uploaded, total});
+}
+
+void PluginState::fireFileUploadCompleted(
+	const QString &fileName,
+	bool success)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onFileUploadCompleted", {fileName}, {success});
+}
+
+void PluginState::fireFileDownloadStarted(
+	const QString &fileName,
+	int64 fileSize)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onFileDownloadStarted", {fileName}, {}, {fileSize});
+}
+
+void PluginState::fireFileDownloadProgress(
+	const QString &fileName,
+	int64 downloaded,
+	int64 total)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onFileDownloadProgress", {fileName}, {}, {downloaded, total});
+}
+
+void PluginState::fireFileDownloadCompleted(
+	const QString &fileName,
+	bool success)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onFileDownloadCompleted", {fileName}, {success});
+}
+
+void PluginState::firePacketReceived(
+	const QString &packetType,
+	int packetSize)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onPacketReceived", {packetType}, {}, {packetSize});
+}
+
+void PluginState::firePacketSent(
+	const QString &packetType,
+	int packetSize)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onPacketSent", {packetType}, {}, {packetSize});
+}
+
+void PluginState::fireConnectionStateChanged(
+	const QString &state)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onConnectionStateChanged", {state});
+}
+
+void PluginState::fireHistoryUpdated(
+	const QString &chatName,
+	const QString &updateType)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onHistoryUpdated", {chatName, updateType});
+}
+
+void PluginState::fireUnreadCountChanged(
+	const QString &chatName,
+	int unreadCount)
+{
+	if (!_L || !_enabled) return;
+	callLuaHook(_L, this, "onUnreadCountChanged", {chatName}, {}, {unreadCount});
 }
 
 int PluginState::luaPrint(lua_State *L) {
@@ -209,9 +424,19 @@ Manager &Manager::instance() {
 void Manager::setSession(not_null<Main::Session*> session) {
 	_sessionLifetime.destroy();
 
+	// Helper lambda to fire events to all enabled plugins
+	const auto fireToAll = [this](auto &&func) {
+		for (auto &plugin : _plugins) {
+			if (plugin->enabled() && plugin->isLoaded()) {
+				func(plugin.get());
+			}
+		}
+	};
+
+	// Message Updates: New messages
 	session->changes().messageUpdates(
 		Data::MessageUpdate::Flag::NewAdded
-	) | rpl::start_with_next([this](const Data::MessageUpdate &update) {
+	) | rpl::start_with_next([=](const Data::MessageUpdate &update) {
 		const auto item = update.item;
 		const auto history = item->history();
 		const auto peer = history->peer;
@@ -222,12 +447,257 @@ void Manager::setSession(not_null<Main::Session*> session) {
 		const QString text = item->originalText().text;
 		const bool isOutgoing = item->out();
 
-		for (auto &plugin : _plugins) {
-			if (plugin->enabled() && plugin->isLoaded()) {
-				plugin->fireNewMessage(chatName, senderName, text, isOutgoing);
-			}
-		}
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireNewMessage(chatName, senderName, text, isOutgoing);
+		});
 	}, _sessionLifetime);
+
+	// Message Updates: Edited messages
+	session->changes().messageUpdates(
+		Data::MessageUpdate::Flag::Edited
+	) | rpl::start_with_next([=](const Data::MessageUpdate &update) {
+		const auto item = update.item;
+		const auto history = item->history();
+		const auto peer = history->peer;
+		const QString chatName = peer->name();
+		const QString senderName = item->from()
+			? item->from()->name()
+			: chatName;
+		const QString newText = item->originalText().text;
+		// For edited messages, we don't have the old text easily accessible
+		// So we'll pass the new text as both old and new for now
+		const QString oldText = newText; // TODO: Store previous text if needed
+		const bool isOutgoing = item->out();
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireMessageEdited(chatName, senderName, oldText, newText, isOutgoing);
+		});
+	}, _sessionLifetime);
+
+	// Message Updates: Deleted messages
+	session->changes().messageUpdates(
+		Data::MessageUpdate::Flag::Destroyed
+	) | rpl::start_with_next([=](const Data::MessageUpdate &update) {
+		const auto item = update.item;
+		const auto history = item->history();
+		const auto peer = history->peer;
+		const QString chatName = peer->name();
+		const QString senderName = item->from()
+			? item->from()->name()
+			: chatName;
+		const QString text = item->originalText().text;
+		const bool isOutgoing = item->out();
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireMessageDeleted(chatName, senderName, text, isOutgoing);
+		});
+	}, _sessionLifetime);
+
+	// Message Updates: Reactions
+	session->changes().messageUpdates(
+		Data::MessageUpdate::Flag::NewUnreadReaction
+	) | rpl::start_with_next([=](const Data::MessageUpdate &update) {
+		const auto item = update.item;
+		const auto history = item->history();
+		const auto peer = history->peer;
+		const QString chatName = peer->name();
+		const QString senderName = item->from()
+			? item->from()->name()
+			: chatName;
+		const QString text = item->originalText().text;
+		const bool isOutgoing = item->out();
+		// Extract reaction info if available
+		const QString reaction = "unknown"; // TODO: Extract actual reaction
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireMessageReaction(chatName, senderName, text, reaction, isOutgoing);
+		});
+	}, _sessionLifetime);
+
+	// History Updates: Message sent
+	session->changes().historyUpdates(
+		Data::HistoryUpdate::Flag::MessageSent
+	) | rpl::start_with_next([=](const Data::HistoryUpdate &update) {
+		const auto history = update.history;
+		const auto peer = history->peer;
+		const QString chatName = peer->name();
+		// Get the last sent message
+		const QString text = "Message sent"; // TODO: Get actual message text
+		const bool isScheduled = false;
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireMessageSent(chatName, text, isScheduled);
+		});
+	}, _sessionLifetime);
+
+	// History Updates: Scheduled message sent
+	session->changes().historyUpdates(
+		Data::HistoryUpdate::Flag::ScheduledSent
+	) | rpl::start_with_next([=](const Data::HistoryUpdate &update) {
+		const auto history = update.history;
+		const auto peer = history->peer;
+		const QString chatName = peer->name();
+		const QString text = "Scheduled message sent";
+		const bool isScheduled = true;
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireMessageSent(chatName, text, isScheduled);
+		});
+	}, _sessionLifetime);
+
+	// History Updates: Unread count changed
+	session->changes().historyUpdates(
+		Data::HistoryUpdate::Flag::UnreadView
+	) | rpl::start_with_next([=](const Data::HistoryUpdate &update) {
+		const auto history = update.history;
+		const auto peer = history->peer;
+		const QString chatName = peer->name();
+		const int unreadCount = history->unreadCount();
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireUnreadCountChanged(chatName, unreadCount);
+		});
+	}, _sessionLifetime);
+
+	// Peer Updates: Various peer changes
+	session->changes().peerUpdates(
+		Data::PeerUpdate::Flag::Name
+		| Data::PeerUpdate::Flag::Photo
+		| Data::PeerUpdate::Flag::OnlineStatus
+		| Data::PeerUpdate::Flag::About
+		| Data::PeerUpdate::Flag::Username
+	) | rpl::start_with_next([=](const Data::PeerUpdate &update) {
+		const auto peer = update.peer;
+		const QString peerName = peer->name();
+		QString updateType = "unknown";
+		
+		if (update.flags & Data::PeerUpdate::Flag::Name) {
+			updateType = "name";
+		} else if (update.flags & Data::PeerUpdate::Flag::Photo) {
+			updateType = "photo";
+		} else if (update.flags & Data::PeerUpdate::Flag::OnlineStatus) {
+			updateType = "online_status";
+			// Also fire online status change for users
+			if (const auto user = peer->asUser()) {
+				const auto lastseen = user->lastseen();
+				const bool isOnline = lastseen.isOnline(::base::unixtime::now());
+				fireToAll([=](PluginState *plugin) {
+					plugin->fireUserOnlineStatusChanged(peerName, isOnline);
+				});
+			}
+		} else if (update.flags & Data::PeerUpdate::Flag::About) {
+			updateType = "about";
+		} else if (update.flags & Data::PeerUpdate::Flag::Username) {
+			updateType = "username";
+		}
+
+		fireToAll([=](PluginState *plugin) {
+			plugin->firePeerUpdated(peerName, updateType);
+		});
+	}, _sessionLifetime);
+
+	// Call events
+	Core::App().calls().currentCallValue(
+	) | rpl::start_with_next([=](Calls::Call *call) {
+		if (!call) return;
+		const auto user = call->user();
+		const QString userName = user->name();
+		// Check if video call by checking remote video state (simplified)
+		const bool isVideo = (call->remoteVideoState() != Webrtc::VideoState::Inactive);
+		const bool isOutgoing = call->type() == Calls::Call::Type::Outgoing;
+		
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireCallStarted(userName, isVideo, isOutgoing);
+		});
+	}, _sessionLifetime);
+
+	// Hook into call state changes - we'll monitor when calls end
+	// Note: This is a simplified approach; full implementation would track call lifecycle
+	Core::App().calls().currentCallValue(
+	) | rpl::filter([=](Calls::Call *call) {
+		return call == nullptr; // Call ended
+	}) | rpl::start_with_next([=] {
+		// When call becomes null, it means call ended
+		// We'll use a simple approach here
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireCallEnded("Unknown", "ended");
+		});
+	}, _sessionLifetime);
+
+	// File upload events - Photo uploads
+	session->uploader().photoProgress(
+	) | rpl::start_with_next([=](const FullMsgId &fullId) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadProgress("photo", 0, 0);
+		});
+	}, _sessionLifetime);
+
+	session->uploader().photoReady(
+	) | rpl::start_with_next([=](const Storage::UploadedMedia &media) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadCompleted("photo", true);
+		});
+	}, _sessionLifetime);
+
+	session->uploader().photoFailed(
+	) | rpl::start_with_next([=](const FullMsgId &fullId) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadCompleted("photo", false);
+		});
+	}, _sessionLifetime);
+
+	// Document uploads
+	session->uploader().documentProgress(
+	) | rpl::start_with_next([=](const FullMsgId &fullId) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadProgress("document", 0, 0);
+		});
+	}, _sessionLifetime);
+
+	session->uploader().documentReady(
+	) | rpl::start_with_next([=](const Storage::UploadedMedia &media) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadCompleted("document", true);
+		});
+	}, _sessionLifetime);
+
+	session->uploader().documentFailed(
+	) | rpl::start_with_next([=](const FullMsgId &fullId) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadCompleted("document", false);
+		});
+	}, _sessionLifetime);
+
+	// Secure uploads (passport files)
+	session->uploader().secureProgress(
+	) | rpl::start_with_next([=](const Storage::UploadSecureProgress &progress) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadProgress("secure_file", progress.offset, progress.size);
+		});
+	}, _sessionLifetime);
+
+	session->uploader().secureReady(
+	) | rpl::start_with_next([=](const Storage::UploadSecureDone &done) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadCompleted("secure_file", true);
+		});
+	}, _sessionLifetime);
+
+	session->uploader().secureFailed(
+	) | rpl::start_with_next([=](const FullMsgId &fullId) {
+		fireToAll([=](PluginState *plugin) {
+			plugin->fireFileUploadCompleted("secure_file", false);
+		});
+	}, _sessionLifetime);
+
+	// File download events - Note: Download manager API is more complex
+	// We'll add basic hooks that can be extended later
+
+	// Note: Download progress and start events would need additional hooks
+	// in the download manager. For now, we'll add basic completion hooks.
+
+	// Network packet events will be added by modifying connection code
+	// See connection_tcp.cpp modifications below
 }
 
 void Manager::clearSession() {
@@ -266,6 +736,30 @@ const std::vector<std::unique_ptr<PluginState>> &Manager::plugins() const {
 
 rpl::producer<> Manager::pluginsChanged() const {
 	return _pluginsChanged.events();
+}
+
+void Manager::firePacketReceived(const QString &packetType, int packetSize) {
+	for (auto &plugin : _plugins) {
+		if (plugin->enabled() && plugin->isLoaded()) {
+			plugin->firePacketReceived(packetType, packetSize);
+		}
+	}
+}
+
+void Manager::firePacketSent(const QString &packetType, int packetSize) {
+	for (auto &plugin : _plugins) {
+		if (plugin->enabled() && plugin->isLoaded()) {
+			plugin->firePacketSent(packetType, packetSize);
+		}
+	}
+}
+
+void Manager::fireConnectionStateChanged(const QString &state) {
+	for (auto &plugin : _plugins) {
+		if (plugin->enabled() && plugin->isLoaded()) {
+			plugin->fireConnectionStateChanged(state);
+		}
+	}
 }
 
 } // namespace Plugins

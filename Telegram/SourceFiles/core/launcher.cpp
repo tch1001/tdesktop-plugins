@@ -565,7 +565,7 @@ void Launcher::processArguments() {
 	}
 
 	static const auto RegExp = QRegularExpression("[^a-z0-9\\-_]");
-	gDebugMode = parseResult.contains("-debug");
+	gDebugMode = parseResult.contains("-debug") || true;
 	gKeyFile = parseResult
 		.value("-key", {})
 		.join(QString())

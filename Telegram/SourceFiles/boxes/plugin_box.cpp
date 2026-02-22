@@ -44,8 +44,8 @@ void ShowLogsBox(
 			while (layout->count() > 0) {
 				delete layout->widgetAt(0);
 			}
-			const auto &logs = plugin->logs();
-			if (logs.isEmpty()) {
+                    const auto &logs = plugin->logs();
+                    if (logs.empty()) {
 				layout->add(
 					object_ptr<Ui::FlatLabel>(
 						layout,

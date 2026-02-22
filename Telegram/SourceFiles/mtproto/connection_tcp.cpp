@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/openssl_help.h"
 #include "base/random.h"
 #include "base/qthelp_url.h"
+#include "plugins/plugin_manager.h"
 
 namespace MTP {
 namespace details {
@@ -391,6 +392,26 @@ void TcpConnection::socketRead() {
 mtpBuffer TcpConnection::parsePacket(bytes::const_span bytes) {
 	const auto packet = _protocol->readPacket(bytes);
 	CONNECTION_LOG_INFO(u"Packet received, size = %1."_q.arg(packet.size()));
+	
+	// Notify plugins about received packet
+	{
+		const auto ints = gsl::make_span(
+			reinterpret_cast<const mtpPrime*>(packet.data()),
+			packet.size() / sizeof(mtpPrime));
+		if (!ints.empty() && ints.size() >= 3) {
+			// Try to determine packet type from first int (MTP constructor)
+			QString packetType = "unknown";
+			if (ints[0] == 0) {
+				packetType = "nop";
+			} else {
+				// MTP constructor number - simplified type detection
+				packetType = QString("mtp_%1").arg(ints[0]);
+			}
+			const int packetSize = int(packet.size());
+			Plugins::Manager::instance().firePacketReceived(packetType, packetSize);
+		}
+	}
+	
 	const auto ints = gsl::make_span(
 		reinterpret_cast<const mtpPrime*>(packet.data()),
 		packet.size() / sizeof(mtpPrime));
@@ -417,10 +438,13 @@ void TcpConnection::socketConnected() {
 
 	_pingTime = crl::now();
 	sendData(std::move(buffer));
+	
+	Plugins::Manager::instance().fireConnectionStateChanged("connected");
 }
 
 void TcpConnection::socketDisconnected() {
 	if (_status == Status::Waiting || _status == Status::Ready) {
+		Plugins::Manager::instance().fireConnectionStateChanged("disconnected");
 		disconnected();
 	}
 }
@@ -439,6 +463,19 @@ void TcpConnection::sendData(mtpBuffer &&buffer) {
 	const auto bytes = _protocol->finalizePacket(buffer);
 	CONNECTION_LOG_INFO(u"TCP Info: write packet %1 bytes."_q
 		.arg(bytes.size()));
+	
+	// Notify plugins about sent packet
+	if (buffer.size() >= 3) {
+		QString packetType = "unknown";
+		if (buffer[0] == 0) {
+			packetType = "nop";
+		} else {
+			packetType = QString("mtp_%1").arg(buffer[0]);
+		}
+		const int packetSize = int(bytes.size());
+		Plugins::Manager::instance().firePacketSent(packetType, packetSize);
+	}
+	
 	aesCtrEncrypt(bytes, _sendKey, &_sendState);
 	_socket->write(connectionStartPrefix, bytes);
 }
@@ -509,6 +546,7 @@ void TcpConnection::connectToServer(
 		const bytes::vector &protocolSecret,
 		int16 protocolDcId,
 		bool protocolForFiles) {
+	DEBUG_LOG(("address='%1'").arg(address));
 	Expects(_address.isEmpty());
 	Expects(_port == 0);
 	Expects(_protocol == nullptr);
