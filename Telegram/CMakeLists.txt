@@ -313,6 +313,7 @@ PRIVATE
     boxes/phone_banned_box.cpp
     boxes/phone_banned_box.h
     boxes/plugin_box.cpp
+    plugins/plugin_window.cpp
     boxes/plugin_box.h
     boxes/pin_messages_box.cpp
     boxes/pin_messages_box.h
@@ -1332,6 +1333,8 @@ PRIVATE
     payments/payments_reaction_process.h
     plugins/plugin_manager.cpp
     plugins/plugin_manager.h
+    plugins/plugin_window.cpp
+    plugins/plugin_window.h
     platform/linux/file_utilities_linux.cpp
     platform/linux/file_utilities_linux.h
     platform/linux/launcher_linux.cpp

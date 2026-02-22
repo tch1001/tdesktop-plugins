@@ -38,6 +38,7 @@ public:
 
 	void setEnabled(bool enabled);
 	void clearLogs();
+	bool reload(); // Reload the plugin from disk
 
 	// Called by Manager to dispatch events
 	void fireNewMessage(

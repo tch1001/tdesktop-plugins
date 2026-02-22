@@ -29,8 +29,10 @@ extern "C" {
 #include <lauxlib.h>
 }
 
+#include <crl/crl_on_main.h>
 #include <QtCore/QFileInfo>
 #include <QtCore/QDateTime>
+#include <atomic>
 
 namespace Plugins {
 
@@ -54,9 +56,11 @@ rpl::producer<> PluginState::logsUpdated() const {
 void PluginState::setEnabled(bool enabled) {
 	if (_enabled == enabled) return;
 	_enabled = enabled;
+	LOG(("PluginManager: setEnabled(%1) for plugin '%2'").arg(enabled).arg(_name));
 	if (_enabled) {
 		if (!load()) {
 			_enabled = false;
+			LOG(("PluginManager: load() failed for plugin '%1'").arg(_name));
 		}
 	} else {
 		unload();
@@ -70,6 +74,16 @@ void PluginState::clearLogs() {
 
 void PluginState::addLogError(const QString &msg) {
 	addLog(msg);
+}
+
+bool PluginState::reload() {
+	if (!_enabled) {
+		return false; // Can't reload if not enabled
+	}
+	const bool wasEnabled = _enabled;
+	unload();
+	_enabled = wasEnabled; // Restore enabled state
+	return load();
 }
 
 bool PluginState::load() {
@@ -116,9 +130,15 @@ bool PluginState::load() {
 	}
 
 	addLog("[INFO] Plugin loaded: " + _name);
+	LOG(("PluginManager: Lua script loaded successfully for plugin '%1'").arg(_name));
 
-	// Call onLoad() if defined
-	callHook("onLoad");
+	// Call onLoad() if defined - wrap in try-catch to prevent crashes
+	try {
+		callHook("onLoad");
+	} catch (...) {
+		addLog("[ERROR] Exception in onLoad hook");
+		// Don't fail loading if onLoad crashes, just log it
+	}
 	return true;
 }
 
@@ -132,6 +152,7 @@ void PluginState::unload() {
 
 void PluginState::addLog(const QString &msg) {
 	_logs.push_back({ msg, QDateTime::currentDateTime() });
+	LOG(("PluginManager[%1]: %2").arg(_name, msg));
 	_logsUpdated.fire({});
 }
 
@@ -175,9 +196,10 @@ bool callLuaHook(
 	lua_getglobal(L, hookName);
 	if (!lua_isfunction(L, -1)) {
 		lua_pop(L, 1);
-		return false;
+		return false; // Hook not defined — normal, not an error
 	}
-	
+
+	LOG(("PluginManager: calling Lua hook '%1'").arg(hookName));
 	int argCount = 0;
 	for (const auto &str : stringArgs) {
 		pushQString(L, str);
@@ -424,6 +446,8 @@ Manager &Manager::instance() {
 void Manager::setSession(not_null<Main::Session*> session) {
 	_sessionLifetime.destroy();
 
+	LOG(("PluginManager: setSession called, %1 plugins loaded").arg(_plugins.size()));
+
 	// Helper lambda to fire events to all enabled plugins
 	const auto fireToAll = [this](auto &&func) {
 		for (auto &plugin : _plugins) {
@@ -433,20 +457,23 @@ void Manager::setSession(not_null<Main::Session*> session) {
 		}
 	};
 
-	// Message Updates: New messages
-	session->changes().messageUpdates(
+	// Message Updates: New messages — use realtime to fire immediately, not batched
+	session->changes().realtimeMessageUpdates(
 		Data::MessageUpdate::Flag::NewAdded
 	) | rpl::start_with_next([=](const Data::MessageUpdate &update) {
 		const auto item = update.item;
+		if (!item) return;
 		const auto history = item->history();
+		if (!history) return;
 		const auto peer = history->peer;
-		const QString chatName = peer->name();
-		const QString senderName = item->from()
+		const QString chatName = peer ? peer->name() : u"unknown"_q;
+		const QString senderName = (item->from() && item->from() != peer)
 			? item->from()->name()
 			: chatName;
 		const QString text = item->originalText().text;
 		const bool isOutgoing = item->out();
 
+		LOG(("PluginManager: onNewMessage fired, chat=%1, sender=%2").arg(chatName, senderName));
 		fireToAll([=](PluginState *plugin) {
 			plugin->fireNewMessage(chatName, senderName, text, isOutgoing);
 		});
@@ -739,27 +766,50 @@ rpl::producer<> Manager::pluginsChanged() const {
 }
 
 void Manager::firePacketReceived(const QString &packetType, int packetSize) {
-	for (auto &plugin : _plugins) {
-		if (plugin->enabled() && plugin->isLoaded()) {
-			plugin->firePacketReceived(packetType, packetSize);
+	// Rate limit: at most 1 dispatch per 100ms to avoid flooding the main thread
+	static std::atomic<qint64> sLastRxFire{ 0 };
+	const auto now = QDateTime::currentMSecsSinceEpoch();
+	const auto prev = sLastRxFire.load(std::memory_order_relaxed);
+	if (now - prev < 100) return;
+	sLastRxFire.store(now, std::memory_order_relaxed);
+
+	// Marshal to main thread — TCP hooks are called from background threads
+	crl::on_main([this, packetType, packetSize] {
+		for (auto &plugin : _plugins) {
+			if (plugin->enabled() && plugin->isLoaded()) {
+				plugin->firePacketReceived(packetType, packetSize);
+			}
 		}
-	}
+	});
 }
 
 void Manager::firePacketSent(const QString &packetType, int packetSize) {
-	for (auto &plugin : _plugins) {
-		if (plugin->enabled() && plugin->isLoaded()) {
-			plugin->firePacketSent(packetType, packetSize);
+	// Rate limit: at most 1 dispatch per 100ms
+	static std::atomic<qint64> sLastTxFire{ 0 };
+	const auto now = QDateTime::currentMSecsSinceEpoch();
+	const auto prev = sLastTxFire.load(std::memory_order_relaxed);
+	if (now - prev < 100) return;
+	sLastTxFire.store(now, std::memory_order_relaxed);
+
+	// Marshal to main thread
+	crl::on_main([this, packetType, packetSize] {
+		for (auto &plugin : _plugins) {
+			if (plugin->enabled() && plugin->isLoaded()) {
+				plugin->firePacketSent(packetType, packetSize);
+			}
 		}
-	}
+	});
 }
 
 void Manager::fireConnectionStateChanged(const QString &state) {
-	for (auto &plugin : _plugins) {
-		if (plugin->enabled() && plugin->isLoaded()) {
-			plugin->fireConnectionStateChanged(state);
+	// Marshal to main thread — may be called from background threads
+	crl::on_main([this, state] {
+		for (auto &plugin : _plugins) {
+			if (plugin->enabled() && plugin->isLoaded()) {
+				plugin->fireConnectionStateChanged(state);
+			}
 		}
-	}
+	});
 }
 
 } // namespace Plugins
