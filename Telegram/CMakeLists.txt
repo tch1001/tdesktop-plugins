@@ -92,6 +92,7 @@ PRIVATE
     desktop-app::external_openssl
     desktop-app::external_openal
     desktop-app::external_xxhash
+    desktop-app::external_lua
 )
 
 target_precompile_headers(Telegram PRIVATE $<$<COMPILE_LANGUAGE:CXX,OBJCXX>:${src_loc}/stdafx.h>)
@@ -311,6 +312,8 @@ PRIVATE
     boxes/passcode_box.h
     boxes/phone_banned_box.cpp
     boxes/phone_banned_box.h
+    boxes/plugin_box.cpp
+    boxes/plugin_box.h
     boxes/pin_messages_box.cpp
     boxes/pin_messages_box.h
     boxes/premium_limits_box.cpp
@@ -1327,6 +1330,8 @@ PRIVATE
     payments/payments_non_panel_process.h
     payments/payments_reaction_process.cpp
     payments/payments_reaction_process.h
+    plugins/plugin_manager.cpp
+    plugins/plugin_manager.h
     platform/linux/file_utilities_linux.cpp
     platform/linux/file_utilities_linux.h
     platform/linux/launcher_linux.cpp

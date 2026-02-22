@@ -11,6 +11,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/event_filter.h"
 #include "base/qt_signal_producer.h"
 #include "boxes/about_box.h"
+#include "boxes/plugin_box.h"
 #include "boxes/peer_list_controllers.h"
 #include "boxes/premium_preview_box.h"
 #include "calls/group/calls_group_common.h"
@@ -703,6 +704,12 @@ void MainMenu::setupMenu() {
 			{ &st::menuIconSavedMessages }
 		)->setClickedCallback([=] {
 			controller->showPeerHistory(controller->session().user());
+		});
+		addAction(
+			rpl::single(u"Plugins"_q),
+			{ &st::menuIconManage }
+		)->setClickedCallback([=] {
+			controller->show(Box(PluginsBox, controller));
 		});
 	} else {
 		addAction(
